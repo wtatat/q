@@ -106,10 +106,10 @@ class config:
     TARGET = constants.COL_TARGET
 
     # --- TEMPORAL SPLIT CONFIG ---
-    TEMPORAL_SPLIT_RATIO = 0.8
+    TEMPORAL_SPLIT_RATIO = 0.85
 
     # --- TRAINING CONFIG ---
-    EARLY_STOPPING_ROUNDS = 50
+    EARLY_STOPPING_ROUNDS = 100
     MODEL_FILENAME = "lgb_model.txt"
 
     # --- TF-IDF PARAMETERS ---
@@ -142,14 +142,16 @@ class config:
     LGB_PARAMS = {
         "objective": "rmse",
         "metric": "rmse",
-        "n_estimators": 2000,
-        "learning_rate": 0.01,
-        "feature_fraction": 0.8,
-        "bagging_fraction": 0.8,
+        "n_estimators": 3000,
+        "learning_rate": 0.02,
+        "feature_fraction": 0.85,
+        "bagging_fraction": 0.85,
         "bagging_freq": 1,
-        "lambda_l1": 0.1,
-        "lambda_l2": 0.1,
-        "num_leaves": 31,
+        "lambda_l1": 0.05,
+        "lambda_l2": 0.05,
+        "num_leaves": 100,
+        "max_depth": 12,
+        "min_child_samples": 10,
         "verbose": -1,
         "n_jobs": -1,
         "seed": RANDOM_STATE,
@@ -335,40 +337,88 @@ def add_aggregate_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataF
     """Добавление агрегированных признаков"""
     print("Adding aggregate features...")
 
-    # User-based aggregates
-    user_agg = train_df.groupby(constants.COL_USER_ID)[config.TARGET].agg(["mean", "count"]).reset_index()
+    # User-based aggregates (расширенные)
+    user_agg = train_df.groupby(constants.COL_USER_ID)[config.TARGET].agg([
+        "mean", "count", "std", "median", "min", "max"
+    ]).reset_index()
     user_agg.columns = [
         constants.COL_USER_ID,
         constants.F_USER_MEAN_RATING,
         constants.F_USER_RATINGS_COUNT,
+        "user_std_rating",
+        "user_median_rating",
+        "user_min_rating",
+        "user_max_rating",
     ]
 
-    # Book-based aggregates
-    book_agg = train_df.groupby(constants.COL_BOOK_ID)[config.TARGET].agg(["mean", "count"]).reset_index()
+    # Book-based aggregates (расширенные)
+    book_agg = train_df.groupby(constants.COL_BOOK_ID)[config.TARGET].agg([
+        "mean", "count", "std", "median", "min", "max"
+    ]).reset_index()
     book_agg.columns = [
         constants.COL_BOOK_ID,
         constants.F_BOOK_MEAN_RATING,
         constants.F_BOOK_RATINGS_COUNT,
+        "book_std_rating",
+        "book_median_rating",
+        "book_min_rating",
+        "book_max_rating",
     ]
 
-    # Author-based aggregates
-    author_agg = train_df.groupby(constants.COL_AUTHOR_ID)[config.TARGET].agg(["mean"]).reset_index()
-    author_agg.columns = [constants.COL_AUTHOR_ID, constants.F_AUTHOR_MEAN_RATING]
+    # Author-based aggregates (расширенные)
+    author_agg = train_df.groupby(constants.COL_AUTHOR_ID)[config.TARGET].agg([
+        "mean", "count", "std"
+    ]).reset_index()
+    author_agg.columns = [
+        constants.COL_AUTHOR_ID,
+        constants.F_AUTHOR_MEAN_RATING,
+        "author_ratings_count",
+        "author_std_rating",
+    ]
 
     df = df.merge(user_agg, on=constants.COL_USER_ID, how="left")
     df = df.merge(book_agg, on=constants.COL_BOOK_ID, how="left")
-    return df.merge(author_agg, on=constants.COL_AUTHOR_ID, how="left")
+    df = df.merge(author_agg, on=constants.COL_AUTHOR_ID, how="left")
+
+    # Interaction features
+    df["user_book_rating_diff"] = df[constants.F_USER_MEAN_RATING] - df[constants.F_BOOK_MEAN_RATING]
+    df["user_author_rating_diff"] = df[constants.F_USER_MEAN_RATING] - df[constants.F_AUTHOR_MEAN_RATING]
+
+    return df
 
 
-def add_genre_features(df: pd.DataFrame, book_genres_df: pd.DataFrame) -> pd.DataFrame:
+def add_genre_features(df: pd.DataFrame, book_genres_df: pd.DataFrame, train_df: pd.DataFrame = None) -> pd.DataFrame:
     """Добавление признаков жанров"""
     print("Adding genre features...")
+
+    # Количество жанров на книгу
     genre_counts = book_genres_df.groupby(constants.COL_BOOK_ID)[constants.COL_GENRE_ID].count().reset_index()
     genre_counts.columns = [
         constants.COL_BOOK_ID,
         constants.F_BOOK_GENRES_COUNT,
     ]
-    return df.merge(genre_counts, on=constants.COL_BOOK_ID, how="left")
+    df = df.merge(genre_counts, on=constants.COL_BOOK_ID, how="left")
+
+    # One-hot encoding для топ-10 жанров
+    top_genres = book_genres_df[constants.COL_GENRE_ID].value_counts().head(10).index.tolist()
+    for genre_id in top_genres:
+        genre_books = book_genres_df[book_genres_df[constants.COL_GENRE_ID] == genre_id][constants.COL_BOOK_ID].unique()
+        df[f"genre_{genre_id}"] = df[constants.COL_BOOK_ID].isin(genre_books).astype(int)
+
+    # Средние оценки по жанрам (если есть train_df)
+    if train_df is not None:
+        # Объединяем train_df с жанрами
+        train_with_genres = train_df.merge(book_genres_df, on=constants.COL_BOOK_ID, how="left")
+        genre_ratings = train_with_genres.groupby(constants.COL_GENRE_ID)[config.TARGET].agg(["mean", "count"]).reset_index()
+        genre_ratings.columns = [constants.COL_GENRE_ID, "genre_mean_rating", "genre_count"]
+
+        # Добавляем средние оценки жанров к книгам
+        book_genre_ratings = book_genres_df.merge(genre_ratings, on=constants.COL_GENRE_ID, how="left")
+        book_avg_genre_rating = book_genre_ratings.groupby(constants.COL_BOOK_ID)["genre_mean_rating"].mean().reset_index()
+        book_avg_genre_rating.columns = [constants.COL_BOOK_ID, "book_avg_genre_rating"]
+        df = df.merge(book_avg_genre_rating, on=constants.COL_BOOK_ID, how="left")
+
+    return df
 
 
 def add_text_features(df: pd.DataFrame, train_df: pd.DataFrame, descriptions_df: pd.DataFrame) -> pd.DataFrame:
@@ -522,20 +572,45 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
     age_median = df[constants.COL_AGE].median()
     df[constants.COL_AGE] = df[constants.COL_AGE].fillna(age_median)
 
-    if constants.F_USER_MEAN_RATING in df.columns:
-        df[constants.F_USER_MEAN_RATING] = df[constants.F_USER_MEAN_RATING].fillna(global_mean)
-    if constants.F_BOOK_MEAN_RATING in df.columns:
-        df[constants.F_BOOK_MEAN_RATING] = df[constants.F_BOOK_MEAN_RATING].fillna(global_mean)
-    if constants.F_AUTHOR_MEAN_RATING in df.columns:
-        df[constants.F_AUTHOR_MEAN_RATING] = df[constants.F_AUTHOR_MEAN_RATING].fillna(global_mean)
+    # Fill mean/median rating features
+    mean_cols = [constants.F_USER_MEAN_RATING, constants.F_BOOK_MEAN_RATING, constants.F_AUTHOR_MEAN_RATING,
+                 "user_median_rating", "book_median_rating", "book_avg_genre_rating"]
+    for col in mean_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(global_mean)
 
-    if constants.F_USER_RATINGS_COUNT in df.columns:
-        df[constants.F_USER_RATINGS_COUNT] = df[constants.F_USER_RATINGS_COUNT].fillna(0)
-    if constants.F_BOOK_RATINGS_COUNT in df.columns:
-        df[constants.F_BOOK_RATINGS_COUNT] = df[constants.F_BOOK_RATINGS_COUNT].fillna(0)
+    # Fill std features
+    std_cols = ["user_std_rating", "book_std_rating", "author_std_rating"]
+    for col in std_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(0)
+
+    # Fill min/max features
+    minmax_cols = ["user_min_rating", "user_max_rating", "book_min_rating", "book_max_rating"]
+    for col in minmax_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(global_mean)
+
+    # Fill count features
+    count_cols = [constants.F_USER_RATINGS_COUNT, constants.F_BOOK_RATINGS_COUNT,
+                  "author_ratings_count", constants.F_BOOK_GENRES_COUNT]
+    for col in count_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(0)
+
+    # Fill interaction features
+    interaction_cols = ["user_book_rating_diff", "user_author_rating_diff"]
+    for col in interaction_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(0)
+
+    # Fill genre features
+    genre_cols = [col for col in df.columns if col.startswith("genre_")]
+    for col in genre_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(0)
 
     df[constants.COL_AVG_RATING] = df[constants.COL_AVG_RATING].fillna(global_mean)
-    df[constants.F_BOOK_GENRES_COUNT] = df[constants.F_BOOK_GENRES_COUNT].fillna(0)
 
     tfidf_cols = [col for col in df.columns if col.startswith("tfidf_")]
     for col in tfidf_cols:
@@ -565,7 +640,7 @@ def create_features(
     if include_aggregates:
         df = add_aggregate_features(df, train_df)
 
-    df = add_genre_features(df, book_genres_df)
+    df = add_genre_features(df, book_genres_df, train_df)
     df = add_text_features(df, train_df, descriptions_df)
     df = add_bert_features(df, train_df, descriptions_df)
     df = handle_missing_values(df, train_df)
